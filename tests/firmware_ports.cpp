@@ -51,6 +51,33 @@ int main(int argc,char **argv){
   auto b=table({p});auto q=parse(b.data(),b.size(),Family::TigerLake);assert(!q.tglDPCandidates(0x18));
  }
  assert(r.tglDPCandidates(0x18)==0x10);
+ // VBT type bit 0x1000 marks an internal DP record. It is never admitted as
+ // firmware-derived fixed HDMI, even when its DVO maps to donor Combo A.
+ auto panelBytes=table({Port{0x70d6,10,1,0x10,0,0}});
+ auto panel=parse(panelBytes.data(),panelBytes.size(),Family::TigerLake);
+ assert(panel.valid()&&panel.present==1&&panel.port[0].dp()&&panel.port[0].internal());
+ assert(!panel.port[0].fixedTMDS()&&panel.hdmi(3).hdmi==0);
+ // Hold the DDI-E backend open so the internal flag is the only distinction
+ // between an external DP candidate and the same VBT record marked internal.
+ auto internalDPBytes=table({Port{0x70d6,11,1,0x50,0,0}});
+ auto internalDP=parse(internalDPBytes.data(),internalDPBytes.size(),Family::TigerLake);
+ assert(internalDP.valid()&&internalDP.port[4].dp()&&internalDP.port[4].internal());
+ assert(!internalDP.tglDPCandidates(1U<<4));
+ auto externalized=internalDP;externalized.port[4].type&=~0x1000U;
+ assert(externalized.tglDPCandidates(1U<<4)==(1U<<4));
+ // Existing external HDMI and DP classifications survive alongside an
+ // internal DP record, which is filtered from external DP admission.
+ auto mixedBytes=table({Port{0x60d2,10,1,0,0,0},Port{0x60d6,9,2,0x40,0,0},
+                        Port{0x70d6,11,3,0x50,0,0}});
+ auto mixed=parse(mixedBytes.data(),mixedBytes.size(),Family::TigerLake);
+ assert(mixed.valid()&&mixed.hdmi(3).hdmi==1&&mixed.tglDPCandidates(0x18)==(1U<<3));
+ // Malformed checksums and conflicting DDI ownership cannot reach either
+ // firmware-derived connector admission path.
+ auto corrupt=mixedBytes;corrupt.back()^=1;auto badVBT=parse(corrupt.data(),corrupt.size(),Family::TigerLake);
+ assert(badVBT.status==Status::Checksum&&!badVBT.tglDPCandidates(0x18)&&!badVBT.hdmi(3).hdmi);
+ auto conflictBytes=table({Port{0x60d2,10,1,0,0,0},Port{0x60d2,10,2,0,0,0}});
+ auto conflict=parse(conflictBytes.data(),conflictBytes.size(),Family::TigerLake);
+ assert(conflict.status==Status::Conflict&&!conflict.tglDPCandidates(0x18)&&!conflict.hdmi(3).hdmi);
  auto shared=r;shared.present|=8;shared.port[3]={0x68c6,9,0,0x50};
  assert(!shared.tglDPCandidates(0x18));
  auto adl=table({{0x60d2,10,1},{0x60d2,7,2},{0x60d2,14,3}});
@@ -78,5 +105,5 @@ int main(int argc,char **argv){
  assert(!region(op.data(),8191,0x80000000).valid);
  // Deterministic bounded mutation sweep: no reads outside declared buffers.
  unsigned seed=7;for(unsigned n=0;n<2000;++n){auto b=bytes;seed=seed*1664525+1013904223;b[seed%b.size()]^=uint8_t(seed>>24);checksum(b);(void)parse(b.data(),b.size(),Family::TigerLake);}
- puts("PASS firmware bounds/checksum/versions, DVO generation maps, HDMI pin permutations, capability vs mode, overrides and OpRegion addresses");
+ puts("PASS VBT bounds/checksum/versions, internal/external connector classification, DVO maps, HDMI pins, overrides and OpRegion addresses");
 }
