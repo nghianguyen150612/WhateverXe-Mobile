@@ -32,6 +32,33 @@ int main(int argc,char **argv){
   auto bytes=table(p);auto r=parse(bytes.data(),bytes.size(),family);assert(r.valid());auto w=r.hdmi(3);
   if(mask==3 && a==b)assert(!w.valid);else {assert(w.valid&&w.hdmi==mask);assert(w.ddc[0]==((mask&1)?a:0));assert(w.ddc[1]==((mask&2)?b:0));}
  }
+ // Internal VBT descriptors are firmware facts, not a qualified eDP
+ // backend. Keep them out of external DP/Type-C and TMDS admission.
+ // The deliberately synthetic type sets DP and internal bits simultaneously;
+ // it is not a claim about any laptop's physical panel or AUX topology.
+ const unsigned tcDVO[]={9,11,13,15,17,19};
+ for(unsigned d=3;d<9;++d) {
+  auto internal=table({{0x70d6,tcDVO[d-3],d+1,(d+1)*0x10,0xc0,0}});
+  auto q=parse(internal.data(),internal.size(),Family::TigerLake);
+  assert(q.valid() && q.present==(1U<<d));
+  assert(q.port[d].dp() && q.port[d].internal());
+  assert(q.tglDPCandidates(0x1f8)==0 && q.hdmi(7).hdmi==0);
+  // A matching external descriptor remains a candidate on the same DDI.
+  auto external=table({{0x60d6,tcDVO[d-3],d+1,(d+1)*0x10,0xc0,0}});
+  auto e=parse(external.data(),external.size(),Family::TigerLake);
+  assert(e.valid() && !e.port[d].internal() && e.tglDPCandidates(0x1f8)==(1U<<d));
+  internal.back()^=1;
+  assert(parse(internal.data(),internal.size(),Family::TigerLake).status==Status::Checksum);
+ }
+ // One internal descriptor must not suppress an independent valid external DP.
+ auto coexist=table({{0x70d6,9,4,0x40,0xc0,0},{0x60d6,11,5,0x50,0xc0,0}});
+ auto mixed=parse(coexist.data(),coexist.size(),Family::TigerLake);
+ assert(mixed.valid() && mixed.port[3].internal() && !mixed.port[4].internal());
+ assert(mixed.tglDPCandidates(0x1f8)==(1U<<4));
+ // A Combo connector marked internal must never become automatic HDMI wiring.
+ auto panelCombo=table({{0x70d6,10,1,0x10,0,0}});
+ auto combo=parse(panelCombo.data(),panelCombo.size(),Family::TigerLake);
+ assert(combo.valid() && combo.port[0].internal() && combo.hdmi(7).hdmi==0);
  auto bytes=table({{0x60d2,1,2,0,0xc0,0},{0x60d6,11,5,0x50,0xc0,3}});
  auto r=parse(bytes.data(),bytes.size(),Family::TigerLake);assert(r.valid()&&r.present==0x12&&r.hdmi(3).hdmi==2&&r.ambiguous==0x10);
  // Type-C capability never becomes an automatic fixed-DP mode decision.
