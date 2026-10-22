@@ -37,7 +37,8 @@ def make_edid(*, invalid_checksum=False, extension_count=0):
     return bytes(data)
 
 
-def make_vbt(*, malformed=False, preceding_mipi_v3=False, duplicate_child=False):
+def make_vbt(*, malformed=False, preceding_mipi_v3=False, duplicate_child=False,
+             trailing_malformed=False, checksum_mismatch=False):
     child = bytearray(38)
     child[2:4] = (0x1004).to_bytes(2, "little")  # internal + DP
     child[16] = 9  # Tiger Lake DVO encoding interpreted by kern_vbt.hpp
@@ -52,7 +53,8 @@ def make_vbt(*, malformed=False, preceding_mipi_v3=False, duplicate_child=False)
     general = bytes(4) + bytes((38,)) + children
     block = bytes((2,)) + len(general).to_bytes(2, "little") + general
     mipi = bytes((53, 0, 0, 3)) + (5).to_bytes(4, "little") if preceding_mipi_v3 else b""
-    blocks = mipi + block
+    tail = bytes((58, 2, 0, 1)) if trailing_malformed else b""
+    blocks = mipi + block + tail
     bdb = bytearray(b"BIOS_DATA_BLOCK " + (216).to_bytes(2, "little") +
                     (22).to_bytes(2, "little") + (22 + len(blocks)).to_bytes(2, "little") + blocks)
     data = bytearray(48 + len(bdb))
@@ -65,6 +67,8 @@ def make_vbt(*, malformed=False, preceding_mipi_v3=False, duplicate_child=False)
     if malformed:
         data[22:24] = (0xFFFF).to_bytes(2, "little")
         data[26] = (-sum(data)) & 0xFF
+    if checksum_mismatch:
+        data[26] ^= 1
     return bytes(data)
 
 
@@ -236,6 +240,43 @@ class LinuxDisplayCollectorTests(unittest.TestCase):
         self.assertFalse(parsed["valid"])
         self.assertEqual(parsed["error"], "conflicting_child_records")
 
+    def test_checksum_diagnostic_extracts_candidates_without_passing_strict_gate(self):
+        damaged = make_vbt(checksum_mismatch=True)
+        strict = collector.parse_vbt(damaged, family="TigerLake")
+        self.assertFalse(strict["valid"])
+        self.assertEqual(strict["error"], "vbt_checksum_failure")
+        self.assertEqual(strict["children"], [])
+
+        diagnostic = collector.parse_vbt(damaged, family="TigerLake", diagnostic_only=True)
+        self.assertFalse(diagnostic["valid"])
+        self.assertFalse(diagnostic["strict_validation_passed"])
+        self.assertEqual(diagnostic["checksum_status"], "MISMATCH")
+        self.assertEqual(diagnostic["error"], "vbt_checksum_failure")
+        self.assertTrue(diagnostic["header_valid"])
+        self.assertTrue(diagnostic["bdb_bounds_valid"])
+        self.assertTrue(diagnostic["bdb_block_stream_valid"])
+        self.assertTrue(diagnostic["structure_valid"])
+        self.assertTrue(diagnostic["general_definitions_valid"])
+        self.assertTrue(diagnostic["child_descriptors_valid"])
+        self.assertEqual(diagnostic["children"][0]["aux_channel"], 0x40)
+        self.assertEqual(diagnostic["runtime_acceptance"], "NOT_EVALUATED_BY_COLLECTOR")
+
+    def test_malformed_unrelated_bdb_tail_does_not_hide_bounded_child_table(self):
+        parsed = collector.parse_vbt(make_vbt(trailing_malformed=True),
+                                     family="TigerLake", diagnostic_only=True)
+        self.assertTrue(parsed["header_checksum_valid"])
+        self.assertTrue(parsed["bdb_bounds_valid"])
+        self.assertFalse(parsed["bdb_block_stream_valid"])
+        self.assertEqual(parsed["bdb_block_stream_error"]["block_id"], 58)
+        self.assertEqual(parsed["bdb_block_stream_error"]["overrun_bytes"], 1)
+        self.assertTrue(parsed["general_definitions_valid"])
+        self.assertTrue(parsed["child_descriptors_valid"])
+        self.assertFalse(parsed["structure_valid"])
+        self.assertFalse(parsed["strict_validation_passed"])
+        self.assertFalse(parsed["valid"])
+        self.assertEqual(parsed["error"], "bdb_block_out_of_bounds")
+        self.assertEqual(len(parsed["children"]), 1)
+
     def test_staged_vbt_import_requires_matching_private_provenance_and_reuses_parser(self):
         with tempfile.TemporaryDirectory() as temp:
             fixture = Fixture(temp)
@@ -268,6 +309,29 @@ class LinuxDisplayCollectorTests(unittest.TestCase):
             self.assertNotIn("0000:00:02.0", saved_shareable)
             self.assertNotIn("fixture-private", saved_shareable)
             self.assertNotIn("/sys/kernel/debug/dri/7", saved_shareable)
+
+    def test_imported_checksum_failure_is_diagnostic_only_and_stays_unadmitted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Fixture(temp)
+            import_dir = fixture.staged_import(Path(temp) / "import")
+            (import_dir / "vbt.bin").write_bytes(make_vbt(checksum_mismatch=True))
+            report, _ = fixture.collect(import_evidence_dir=import_dir)
+            intel_debug = next(item for item in report["debugfs"]["devices"]
+                               if item["bdf"] == "0000:00:02.0")
+            vbt = intel_debug["files"]["i915_vbt"]
+            self.assertFalse(vbt["parsed"]["valid"])
+            self.assertTrue(vbt["parsed"]["diagnostic_only"])
+            self.assertTrue(vbt["parsed"]["child_descriptors_valid"])
+            self.assertEqual(len(vbt["parsed"]["firmware_route_candidates"]), 1)
+            self.assertEqual(vbt["project_runtime_acceptance"]["value"], "BLOCKED_BY_CHECKSUM")
+            self.assertEqual(vbt["project_runtime_acceptance"]["status"], "BLOCKED")
+            shareable = collector.shareable_inventory(report)
+            shareable_vbt = shareable["vbt"]["validated_files"][0]
+            self.assertFalse(shareable_vbt["valid"]["value"])
+            self.assertEqual(shareable_vbt["project_runtime_acceptance"]["value"],
+                             "BLOCKED_BY_CHECKSUM")
+            self.assertEqual(shareable_vbt["firmware_route_candidates"][0]["status"], "UNKNOWN")
+            self.assertNotIn(make_vbt(checksum_mismatch=True).hex(), json.dumps(shareable))
 
     def test_debugfs_raw_names_do_not_collide_across_intel_devices(self):
         with tempfile.TemporaryDirectory() as temp:

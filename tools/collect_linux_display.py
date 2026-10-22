@@ -222,15 +222,54 @@ def _project_vbt_ddi(family: str | None, dvo: int) -> int | None:
     return None
 
 
-def parse_vbt(data: bytes, *, family: str | None = None) -> dict[str, Any]:
-    """Validate bounded VBT/BDB metadata and extract General Definitions children."""
+def _expected_child_descriptor_size(bdb_version: int) -> int:
+    """Mirror Linux v7.2 child-device descriptor sizes by BDB version."""
+    if bdb_version >= 263:
+        return 44
+    if bdb_version >= 256:
+        return 40
+    if bdb_version >= 216:
+        return 39
+    if bdb_version >= 196:
+        return 38
+    if bdb_version >= 195:
+        return 37
+    if bdb_version >= 111:
+        return 33
+    if bdb_version >= 106:
+        return 27
+    return 22
+
+
+def parse_vbt(data: bytes, *, family: str | None = None,
+              diagnostic_only: bool = False) -> dict[str, Any]:
+    """Inspect bounded VBT metadata; checksum bypass is diagnostic-only.
+
+    ``valid`` retains the strict checksum-gated General Definitions result.
+    Diagnostic mode can continue after a checksum mismatch to describe the
+    bounded child table, but never changes ``valid`` or represents runtime
+    admission. The complete BDB block stream is reported separately because
+    Linux's VBT parser can consume earlier sections even when a later block is
+    malformed.
+    """
     result: dict[str, Any] = {
         "valid": False, "signature": None, "declared_length": None,
         "header_length": None, "header_checksum_valid": None,
         "bdb_offset": None, "bdb_header_length": None, "bdb_length": None,
         "bdb_version": None, "general_definitions_present": False,
         "child_descriptor_stride": None, "children": [], "unmapped_children": 0,
-        "error": None,
+        "error": None, "diagnostic_only": diagnostic_only,
+        "header_valid": False, "bdb_bounds_valid": False,
+        "bdb_block_stream_valid": None, "bdb_block_stream_error": None,
+        "bdb_block_count": 0, "bdb_blocks": [],
+        "general_definitions_valid": False, "child_descriptors_valid": False,
+        "child_descriptor_expected_size": None,
+        "child_descriptor_size_matches_bdb_version": None,
+        "child_descriptor_count": None, "populated_child_count": None,
+        "structure_valid": False, "strict_validation_passed": False,
+        "checksum_status": "UNKNOWN",
+        "runtime_acceptance": "NOT_EVALUATED_BY_COLLECTOR",
+        "firmware_route_candidates": [], "remaining_uncertainty": [],
     }
 
     def fail(message: str) -> dict[str, Any]:
@@ -248,8 +287,10 @@ def parse_vbt(data: bytes, *, family: str | None = None) -> dict[str, Any]:
     result.update(header_length=header, declared_length=declared, bdb_offset=bdb)
     if header < 48 or declared < header or declared > len(data) or bdb < header or bdb > declared:
         return fail("invalid_vbt_bounds")
+    result["header_valid"] = True
     result["header_checksum_valid"] = sum(data[:declared]) % 256 == 0
-    if not result["header_checksum_valid"]:
+    result["checksum_status"] = "VALID" if result["header_checksum_valid"] else "MISMATCH"
+    if not result["header_checksum_valid"] and not diagnostic_only:
         return fail("vbt_checksum_failure")
     if declared - bdb < 22:
         return fail("truncated_bdb_header")
@@ -262,27 +303,52 @@ def parse_vbt(data: bytes, *, family: str | None = None) -> dict[str, Any]:
     result.update(bdb_version=bdb_version, bdb_header_length=bdb_header, bdb_length=bdb_length)
     if bdb_header < 22 or bdb_length < bdb_header or bdb_length > len(bdata):
         return fail("invalid_bdb_bounds")
+    result["bdb_bounds_valid"] = True
     if not 216 <= bdb_version <= 256:
         return fail("unsupported_bdb_version")
     offset, general = bdb_header, None
+    stream_error = None
     while offset < bdb_length:
         if bdb_length - offset < 3:
-            return fail("truncated_bdb_block_header")
+            stream_error = {"error": "truncated_bdb_block_header", "offset": offset,
+                            "remaining_bytes": bdb_length - offset}
+            break
         block_id = bdata[offset]
         block_length = int.from_bytes(bdata[offset + 1:offset + 3], "little")
         if block_id == 53:
             if bdb_length - offset < 4:
-                return fail("truncated_bdb_block_header")
+                stream_error = {"error": "truncated_bdb_block_header", "offset": offset,
+                                "block_id": block_id,
+                                "remaining_bytes": bdb_length - offset}
+                break
             if bdata[offset + 3] >= 3:
                 if bdb_length - offset < 8:
-                    return fail("truncated_bdb_block_header")
+                    stream_error = {"error": "truncated_bdb_block_header", "offset": offset,
+                                    "block_id": block_id,
+                                    "remaining_bytes": bdb_length - offset}
+                    break
                 block_length = int.from_bytes(bdata[offset + 4:offset + 8], "little")
-        if block_length > bdb_length - offset - 3:
-            return fail("bdb_block_out_of_bounds")
-        if block_id == 2:
-            general = bdata[offset + 3:offset + 3 + block_length]
+        available = bdb_length - offset - 3
+        if block_length > available:
+            stream_error = {"error": "bdb_block_out_of_bounds", "offset": offset,
+                            "block_id": block_id, "declared_bytes": block_length,
+                            "available_bytes": available,
+                            "overrun_bytes": block_length - available}
+            result["bdb_blocks"].append({"id": block_id, "offset": offset,
+                                         "declared_bytes": block_length,
+                                         "available_bytes": available,
+                                         "bounded": False})
             break
+        result["bdb_blocks"].append({"id": block_id, "offset": offset,
+                                     "declared_bytes": block_length,
+                                     "available_bytes": block_length,
+                                     "bounded": True})
+        result["bdb_block_count"] += 1
+        if block_id == 2 and general is None:
+            general = bdata[offset + 3:offset + 3 + block_length]
         offset += 3 + block_length
+    result["bdb_block_stream_valid"] = stream_error is None
+    result["bdb_block_stream_error"] = stream_error
     if general is None:
         return fail("general_definitions_missing")
     result["general_definitions_present"] = True
@@ -290,16 +356,25 @@ def parse_vbt(data: bytes, *, family: str | None = None) -> dict[str, Any]:
         return fail("general_definitions_truncated")
     stride = general[4]
     result["child_descriptor_stride"] = stride
+    expected_stride = _expected_child_descriptor_size(bdb_version)
+    result["child_descriptor_expected_size"] = expected_stride
+    result["child_descriptor_size_matches_bdb_version"] = stride == expected_stride
     if stride < 38 or stride > 64 or (len(general) - 5) % stride:
         return fail("invalid_child_descriptor_layout")
+    result["child_descriptor_count"] = (len(general) - 5) // stride
     mapped_slots: set[int] = set()
+    populated = 0
+    valid_aux_codes = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90}
     for offset in range(5, len(general), stride):
         child = general[offset:offset + stride]
         port_type = int.from_bytes(child[2:4], "little")
         if not port_type:
             continue
+        populated += 1
+        handle = int.from_bytes(child[0:2], "little")
         dvo, ddc, aux = child[16], child[19], child[25]
         physical_slot = _project_vbt_ddi(family, dvo)
+        aux_encoding_valid = aux == 0 or aux in valid_aux_codes
         if physical_slot is None:
             result["unmapped_children"] += 1
         elif physical_slot in mapped_slots:
@@ -307,14 +382,68 @@ def parse_vbt(data: bytes, *, family: str | None = None) -> dict[str, Any]:
         else:
             mapped_slots.add(physical_slot)
         result["children"].append({
+            "descriptor_index": (offset - 5) // stride,
+            "descriptor_size": stride, "handle": handle,
             "port_type": port_type, "dvo_port": dvo, "ddc_pin": ddc,
             "aux_channel": aux, "physical_ddi_slot_from_project_parser": physical_slot,
             "firmware_internal_flag": bool(port_type & 0x1000),
             "firmware_dp_flag": bool(port_type & 0x4),
             "descriptor_flags": child[23], "capabilities": child[33],
+            "record_bounds_valid": len(child) == stride,
+            "aux_encoding_valid": aux_encoding_valid,
         })
-    result["valid"] = True
+    result["populated_child_count"] = populated
+    result["general_definitions_valid"] = True
+    result["child_descriptors_valid"] = all(
+        child["record_bounds_valid"] and child["aux_encoding_valid"]
+        for child in result["children"]
+    )
+    result["firmware_route_candidates"] = [
+        child for child in result["children"] if child["firmware_dp_flag"]
+    ]
+    result["structure_valid"] = (
+        result["bdb_bounds_valid"] and result["bdb_block_stream_valid"] is True
+        and result["general_definitions_valid"] and result["child_descriptors_valid"]
+    )
+    result["strict_validation_passed"] = (
+        result["header_checksum_valid"] is True and result["structure_valid"]
+    )
+    result["valid"] = result["strict_validation_passed"]
+    if result["header_checksum_valid"] is False:
+        result["error"] = "vbt_checksum_failure"
+        result["remaining_uncertainty"].append("VBT checksum mismatch prevents integrity confirmation.")
+    if stream_error is not None:
+        if result["error"] is None:
+            result["error"] = stream_error["error"]
+        result["remaining_uncertainty"].append("At least one BDB block is malformed or truncated within the declared BDB extent.")
+    if result["child_descriptor_size_matches_bdb_version"] is False:
+        result["remaining_uncertainty"].append("Child descriptor stride differs from the BDB-version expected size.")
+    if result["unmapped_children"]:
+        result["remaining_uncertainty"].append("One or more populated child descriptors do not map to a known physical DDI for this family.")
+    if result["firmware_route_candidates"]:
+        result["remaining_uncertainty"].append("Firmware route candidates do not establish the active Linux connector-to-port relationship.")
+    if stream_error is not None:
+        result["warning"] = "bdb_block_stream_invalid"
     return result
+
+
+def _project_runtime_acceptance(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Report the separate native checksum gate without invoking runtime code."""
+    if parsed.get("header_checksum_valid") is False:
+        return evidence(
+            "BLOCKED_BY_CHECKSUM", "WhateverXe native VBT parser policy",
+            "compare diagnostic parse with the strict runtime checksum guard",
+            status="BLOCKED", availability="SOURCE_REVIEWED", confidence="high",
+            interpretation="The current native parser returns Checksum before parsing child records; diagnostic extraction does not admit the VBT.",
+            ambiguity="No runtime parser or display hardware path was invoked.",
+        )
+    return evidence(
+        "NOT_EVALUATED", "WhateverXe native VBT parser policy",
+        "record that runtime admission was not executed",
+        status="UNKNOWN", availability="NOT_ASSESSED", confidence="none",
+        interpretation="Collector diagnostics do not establish runtime admission.",
+        ambiguity="No native runtime parse was run.",
+    )
 
 
 def _parse_cpuinfo(text: str) -> dict[str, str]:
@@ -740,14 +869,16 @@ def _scan_debugfs(debug_root: Path, intel_devices: list[dict[str, Any]], raw: di
             filespec: dict[str, Any] = {"bytes": len(data), "raw_file": raw_name}
             if filename == "i915_vbt":
                 family = (device.get("source_catalog_match", {}).get("value", {}) or {}).get("family")
-                parsed = parse_vbt(data, family=family)
+                parsed = parse_vbt(data, family=family, diagnostic_only=True)
                 filespec["parsed"] = parsed
+                filespec["project_runtime_acceptance"] = _project_runtime_acceptance(parsed)
                 filespec["validation"] = evidence(parsed["valid"], f"/sys/kernel/debug/dri/{node.name}/{filename}",
-                                                   "validate VBT signature, bounds, checksum, BDB and child records",
+                                                   "run strict checksum-gated VBT child-table validation",
                                                    status="CONFIRMED" if parsed["valid"] else "CONTRADICTED",
-                                                   confidence="high" if parsed["valid"] else "none",
-                                                   interpretation="Independent bounded parser; raw VBT remains private.",
-                                                   ambiguity=parsed["error"] or "Validated fields still describe firmware declarations, not live link state.")
+                                                   confidence="high",
+                                                   interpretation="Strict collector result is separate from diagnostic extraction; raw VBT remains private.",
+                                                   ambiguity=parsed["error"] or parsed.get("warning") or
+                                                   "Validated fields still describe firmware declarations, not live link state.")
             elif filename in {"i915_display_info", "i915_edp_psr_status"}:
                 text = data.decode("utf-8", errors="replace")
                 excerpts = [{"line": n, "text": line.strip()[:500]}
@@ -954,14 +1085,16 @@ def _import_staged_evidence_from_fd(report: dict[str, Any], raw: dict[str, bytes
         }
         if diagnostic == "i915_vbt":
             family = (matched_devices[0].get("source_catalog_match", {}).get("value", {}) or {}).get("family")
-            parsed = parse_vbt(content, family=family)
+            parsed = parse_vbt(content, family=family, diagnostic_only=True)
             entry["parsed"] = parsed
+            entry["project_runtime_acceptance"] = _project_runtime_acceptance(parsed)
             entry["validation"] = evidence(
-                parsed["valid"], source, "validate VBT signature, bounds, checksum, BDB and child records",
+                parsed["valid"], source, "run strict checksum-gated VBT child-table validation",
                 status="CONFIRMED" if parsed["valid"] else "CONTRADICTED",
-                confidence="high" if parsed["valid"] else "none",
-                interpretation="Independent bounded parser; raw VBT remains private.",
-                ambiguity=parsed["error"] or "Validated firmware declarations do not establish live link state.",
+                confidence="high",
+                interpretation="Strict collector result is separate from diagnostic extraction; raw VBT remains private.",
+                ambiguity=parsed["error"] or parsed.get("warning") or
+                "Validated firmware declarations do not establish live link state.",
             )
         elif diagnostic in {"i915_display_info", "i915_edp_psr_status"}:
             text = content.decode("utf-8", errors="replace")
@@ -1253,15 +1386,27 @@ def shareable_inventory(report: dict[str, Any]) -> dict[str, Any]:
         vbt = device.get("files", {}).get("i915_vbt", {})
         if "parsed" in vbt:
             parsed = vbt["parsed"]
+
+            def parser_fact(key: str, method: str) -> dict[str, Any]:
+                value = parsed.get(key)
+                status = "UNKNOWN" if value is None else "CONFIRMED" if value is True else \
+                    "CONTRADICTED" if value is False else "UNKNOWN"
+                return public_evidence(evidence(
+                    value, "matched Intel read-only VBT interface", method,
+                    status=status, confidence="high" if isinstance(value, bool) else "none",
+                    interpretation="Bounded diagnostic parser fact; it does not establish runtime admission.",
+                    ambiguity="Checksum integrity and other BDB blocks are reported separately."),
+                    "matched Intel read-only VBT interface; node omitted")
+
             vbt_files.append({
                 "valid": public_evidence(vbt["validation"], "matched Intel read-only VBT interface; node omitted"),
                 "bdb_version": evidence(parsed["bdb_version"], "matched Intel read-only VBT interface",
-                                         "parse bounded BDB header", status="CONFIRMED" if parsed["valid"] else "UNKNOWN",
-                                         confidence="high" if parsed["valid"] else "none",
+                                         "parse bounded BDB header", status="CONFIRMED" if parsed["bdb_bounds_valid"] else "UNKNOWN",
+                                         confidence="high" if parsed["bdb_bounds_valid"] else "none",
                                          interpretation="Firmware metadata version only.", ambiguity="Does not establish runtime display state."),
                 "declared_length": evidence(parsed["declared_length"], "matched Intel read-only VBT interface",
-                                            "parse bounded VBT header", status="CONFIRMED" if parsed["valid"] else "UNKNOWN",
-                                            confidence="high" if parsed["valid"] else "none",
+                                            "parse bounded VBT header", status="CONFIRMED" if parsed["header_valid"] else "UNKNOWN",
+                                            confidence="high" if parsed["header_valid"] else "none",
                                             interpretation="VBT header declared length.", ambiguity="Does not establish runtime display state."),
                 "header_checksum_valid": evidence(parsed["header_checksum_valid"], "matched Intel read-only VBT interface",
                                                   "validate VBT checksum over declared bytes",
@@ -1271,13 +1416,45 @@ def shareable_inventory(report: dict[str, Any]) -> dict[str, Any]:
                                                   interpretation="Checksum validity for the VBT header-declared extent.",
                                                   ambiguity="A valid checksum does not establish supported topology."),
                 "bdb_length": evidence(parsed["bdb_length"], "matched Intel read-only VBT interface",
-                                       "parse bounded BDB header", status="CONFIRMED" if parsed["valid"] else "UNKNOWN",
-                                       confidence="high" if parsed["valid"] else "none",
+                                       "parse bounded BDB header", status="CONFIRMED" if parsed["bdb_bounds_valid"] else "UNKNOWN",
+                                       confidence="high" if parsed["bdb_bounds_valid"] else "none",
                                        interpretation="BDB header declared length.", ambiguity="Does not establish runtime display state."),
                 "child_descriptor_stride": evidence(parsed["child_descriptor_stride"], "matched Intel read-only VBT interface",
-                                                      "parse General Definitions block", status="CONFIRMED" if parsed["valid"] else "UNKNOWN",
-                                                      confidence="high" if parsed["valid"] else "none",
+                                                      "parse General Definitions block", status="CONFIRMED" if parsed["general_definitions_valid"] else "UNKNOWN",
+                                                      confidence="high" if parsed["general_definitions_valid"] else "none",
                                                       interpretation="Descriptor byte stride.", ambiguity="Does not establish live connector wiring."),
+                "diagnostic_validation": {
+                    "header_valid": parser_fact("header_valid", "validate bounded VBT header"),
+                    "bdb_bounds_valid": parser_fact("bdb_bounds_valid", "validate bounded BDB header and extent"),
+                    "bdb_block_stream_valid": parser_fact("bdb_block_stream_valid", "walk every bounded BDB block"),
+                    "general_definitions_valid": parser_fact("general_definitions_valid", "validate General Definitions layout"),
+                    "child_descriptors_valid": parser_fact("child_descriptors_valid", "validate bounded child descriptor slots"),
+                    "child_descriptor_size_matches_bdb_version": parser_fact(
+                        "child_descriptor_size_matches_bdb_version", "compare descriptor stride with BDB-version layout"),
+                    "structure_valid": parser_fact("structure_valid", "validate complete BDB stream and child table"),
+                    "strict_validation_passed": parser_fact("strict_validation_passed", "apply checksum-gated collector validation"),
+                },
+                "firmware_route_candidates": [{
+                    "dvo_port": child.get("dvo_port"),
+                    "aux_channel": child.get("aux_channel"),
+                    "physical_ddi_slot_from_project_parser": child.get("physical_ddi_slot_from_project_parser"),
+                    "firmware_internal_flag": child.get("firmware_internal_flag"),
+                    "record_bounds_valid": child.get("record_bounds_valid"),
+                    "aux_encoding_valid": child.get("aux_encoding_valid"),
+                    "status": "UNKNOWN" if not parsed["valid"] else "CONFIRMED",
+                    "confidence": "none" if not parsed["valid"] else "high",
+                    "source": "matched Intel read-only VBT interface; raw firmware omitted",
+                    "interpretation": "Diagnostic firmware candidate only; it is not runtime admission or proof of active routing.",
+                    "ambiguity": "Checksum and full BDB stream integrity are reported separately.",
+                } for child in parsed.get("firmware_route_candidates", [])],
+                "remaining_uncertainty": parsed.get("remaining_uncertainty", []),
+                "project_runtime_acceptance": public_evidence(
+                    vbt.get("project_runtime_acceptance", evidence(
+                        "NOT_EVALUATED", "WhateverXe native VBT parser policy", "record that runtime admission was not executed",
+                        status="UNKNOWN", availability="NOT_ASSESSED", confidence="none",
+                        interpretation="Collector diagnostics do not establish runtime admission.",
+                        ambiguity="No native runtime parse was run.")),
+                    "WhateverXe runtime parser policy; local source path omitted"),
                 "children": [{
                     "port_type": child.get("port_type"),
                     "dvo_port": child.get("dvo_port"), "ddc_pin": child.get("ddc_pin"),
@@ -1287,11 +1464,13 @@ def shareable_inventory(report: dict[str, Any]) -> dict[str, Any]:
                     "firmware_dp_flag": child.get("firmware_dp_flag"),
                     "descriptor_flags": child.get("descriptor_flags"),
                     "capabilities": child.get("capabilities"),
+                    "record_bounds_valid": child.get("record_bounds_valid"),
+                    "aux_encoding_valid": child.get("aux_encoding_valid"),
                     "source": "matched Intel read-only VBT interface; raw firmware omitted",
                     "method": "decode General Definitions child descriptor",
                     "status": "CONFIRMED" if parsed["valid"] else "UNKNOWN",
                     "availability": "AVAILABLE", "confidence": "high" if parsed["valid"] else "none",
-                    "interpretation": "These are firmware declarations, not live link state.",
+                    "interpretation": "These declarations came from bounded records; the checksum mismatch keeps candidates diagnostic and unadmitted.",
                     "ambiguity": "Firmware DVO/AUX fields do not alone prove connector-to-port association.",
                 } for child in parsed["children"]],
             })
