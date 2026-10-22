@@ -37,7 +37,7 @@ def make_edid(*, invalid_checksum=False, extension_count=0):
     return bytes(data)
 
 
-def make_vbt(*, malformed=False):
+def make_vbt(*, malformed=False, preceding_mipi_v3=False, duplicate_child=False):
     child = bytearray(38)
     child[2:4] = (0x1004).to_bytes(2, "little")  # internal + DP
     child[16] = 9  # Tiger Lake DVO encoding interpreted by kern_vbt.hpp
@@ -45,10 +45,16 @@ def make_vbt(*, malformed=False):
     child[23] = 0x20
     child[25] = 0x40
     child[33] = 0
-    general = bytes(4) + bytes((38,)) + child
+    second_child = bytearray(38)
+    second_child[2:4] = (0x1004).to_bytes(2, "little")
+    second_child[16] = 3  # HDMI DVO code shares Tiger Lake's DDI 3 slot with DVO 9.
+    children = child + (second_child if duplicate_child else b"")
+    general = bytes(4) + bytes((38,)) + children
     block = bytes((2,)) + len(general).to_bytes(2, "little") + general
+    mipi = bytes((53, 0, 0, 3)) + (5).to_bytes(4, "little") if preceding_mipi_v3 else b""
+    blocks = mipi + block
     bdb = bytearray(b"BIOS_DATA_BLOCK " + (216).to_bytes(2, "little") +
-                    (22).to_bytes(2, "little") + (22 + len(block)).to_bytes(2, "little") + block)
+                    (22).to_bytes(2, "little") + (22 + len(blocks)).to_bytes(2, "little") + blocks)
     data = bytearray(48 + len(bdb))
     data[:4] = b"$VBT"
     data[22:24] = (48).to_bytes(2, "little")
@@ -120,9 +126,36 @@ class Fixture:
             (path / "edid").write_bytes(edid)
         return path
 
-    def collect(self):
+    def collect(self, import_evidence_dir=None):
         return collector.collect_inventory(sys_root=self.sys, proc_root=self.proc, etc_root=self.etc,
-                                           debug_root=self.debug, read_kernel_logs=False)
+                                           debug_root=self.debug, read_kernel_logs=False,
+                                           import_evidence_dir=import_evidence_dir)
+
+    def staged_import(self, directory, *, target_bdf="0000:00:02.0", identity_contents="i915 dev=0000:00:02.0 unique=fixture-private"):
+        directory = Path(directory)
+        directory.mkdir(mode=0o700)
+        vbt_path = directory / "vbt.bin"
+        vbt_path.write_bytes(make_vbt())
+        vbt_path.chmod(0o600)
+        manifest = {
+            "schema_version": 1,
+            "target_pci_bdf": target_bdf,
+            "collection_method": "approved read-only debugfs copy",
+            "source_identity": {
+                "path": "/sys/kernel/debug/dri/7/name",
+                "contents": identity_contents,
+            },
+            "files": {
+                "i915_vbt": {
+                    "filename": "vbt.bin",
+                    "source": "/sys/kernel/debug/dri/7/i915_vbt",
+                },
+            },
+        }
+        manifest_path = directory / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest))
+        manifest_path.chmod(0o600)
+        return directory
 
 
 class LinuxDisplayCollectorTests(unittest.TestCase):
@@ -175,7 +208,7 @@ class LinuxDisplayCollectorTests(unittest.TestCase):
             self.assertIsNone(report["topology"]["physical_ddi"]["value"])
 
     def test_valid_vbt_extracts_metadata_and_internal_child(self):
-        parsed = collector.parse_vbt(make_vbt())
+        parsed = collector.parse_vbt(make_vbt(), family="TigerLake")
         self.assertTrue(parsed["valid"], parsed["error"])
         self.assertEqual(parsed["declared_length"], len(make_vbt()))
         self.assertEqual(parsed["bdb_version"], 216)
@@ -183,8 +216,165 @@ class LinuxDisplayCollectorTests(unittest.TestCase):
         self.assertEqual(parsed["children"][0]["physical_ddi_slot_from_project_parser"], 3)
         self.assertTrue(parsed["children"][0]["firmware_internal_flag"])
 
+    def test_vbt_parser_matches_project_mipi_sequence_v3_block_sizing(self):
+        parsed = collector.parse_vbt(make_vbt(preceding_mipi_v3=True), family="TigerLake")
+        self.assertTrue(parsed["valid"], parsed["error"])
+        self.assertEqual(parsed["bdb_version"], 216)
+        self.assertEqual(parsed["children"][0]["dvo_port"], 9)
+        self.assertEqual(parsed["children"][0]["physical_ddi_slot_from_project_parser"], 3)
+
+    def test_vbt_ddi_slot_decoding_uses_observed_source_family(self):
+        tiger_lake = collector.parse_vbt(make_vbt(), family="TigerLake")
+        alder_lake_n = collector.parse_vbt(make_vbt(), family="AlderLakeN")
+        unknown = collector.parse_vbt(make_vbt())
+        self.assertEqual(tiger_lake["children"][0]["physical_ddi_slot_from_project_parser"], 3)
+        self.assertIsNone(alder_lake_n["children"][0]["physical_ddi_slot_from_project_parser"])
+        self.assertIsNone(unknown["children"][0]["physical_ddi_slot_from_project_parser"])
+
+    def test_vbt_parser_rejects_conflicting_mapped_child_records(self):
+        parsed = collector.parse_vbt(make_vbt(duplicate_child=True), family="TigerLake")
+        self.assertFalse(parsed["valid"])
+        self.assertEqual(parsed["error"], "conflicting_child_records")
+
+    def test_staged_vbt_import_requires_matching_private_provenance_and_reuses_parser(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Fixture(temp)
+            import_dir = fixture.staged_import(Path(temp) / "import")
+            report, raw = fixture.collect(import_evidence_dir=import_dir)
+            intel_debug = next(item for item in report["debugfs"]["devices"]
+                               if item["bdf"] == "0000:00:02.0")
+            self.assertEqual(intel_debug["node"]["value"], "7")
+            self.assertEqual(intel_debug["name"]["value"],
+                             "i915 dev=0000:00:02.0 unique=fixture-private")
+            vbt = intel_debug["files"]["i915_vbt"]
+            self.assertTrue(vbt["parsed"]["valid"])
+            self.assertEqual(vbt["parsed"]["children"][0]["aux_channel"], 0x40)
+            self.assertEqual(raw[vbt["raw_file"]], make_vbt())
+            self.assertIn("collection_method", intel_debug["import_provenance"])
+            shareable_data = collector.shareable_inventory(report)
+            self.assertEqual(shareable_data["vbt"]["acquisition"]["status"], "CONFIRMED")
+            self.assertEqual(shareable_data["vbt"]["validated_files"][0]["children"][0]["capabilities"], 0)
+            shareable = json.dumps(shareable_data)
+            self.assertNotIn("0000:00:02.0", shareable)
+            self.assertNotIn("fixture-private", shareable)
+            self.assertNotIn(make_vbt().hex(), shareable)
+            with mock.patch.object(collector, "run_optional_decoders"):
+                session = collector.write_reports(report, raw, Path(temp) / "reports")
+            imported_raw = session / "raw" / vbt["raw_file"]
+            self.assertEqual(imported_raw.read_bytes(), make_vbt())
+            self.assertEqual(imported_raw.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(session.stat().st_mode & 0o777, 0o700)
+            saved_shareable = (session / "shareable.json").read_text()
+            self.assertNotIn("0000:00:02.0", saved_shareable)
+            self.assertNotIn("fixture-private", saved_shareable)
+            self.assertNotIn("/sys/kernel/debug/dri/7", saved_shareable)
+
+    def test_debugfs_raw_names_do_not_collide_across_intel_devices(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Fixture(temp)
+            second = fixture._pci("0000:00:04.0", 0x8086, 0x9A49, "i915")
+            node_first = fixture.debug / "dri" / "2"
+            node_second = fixture.debug / "dri" / "9"
+            node_first.mkdir(parents=True)
+            node_second.mkdir(parents=True)
+            (node_first / "name").write_text("i915 dev=0000:00:02.0\n")
+            (node_first / "i915_vbt").write_bytes(make_vbt())
+            (node_second / "name").write_text("i915 dev=0000:00:04.0\n")
+            (node_second / "i915_vbt").write_bytes(make_vbt(preceding_mipi_v3=True))
+            report, raw = fixture.collect()
+            files = [item["files"]["i915_vbt"]["raw_file"] for item in report["debugfs"]["devices"]]
+            self.assertEqual(len(files), 2)
+            self.assertEqual(len(set(files)), 2)
+            self.assertTrue(all(filename in raw for filename in files))
+            self.assertIsNotNone(second)
+
+    def test_debugfs_mapping_requires_explicit_unique_dev_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Fixture(temp)
+            node = fixture.debug / "dri" / "4"
+            node.mkdir(parents=True)
+            (node / "name").write_text("i915 alias=0000:00:02.0\n")
+            (node / "i915_vbt").write_bytes(make_vbt())
+
+            report, raw = fixture.collect()
+            intel_debug = next(item for item in report["debugfs"]["devices"]
+                               if item["bdf"] == "0000:00:02.0")
+            self.assertIsNone(intel_debug["node"]["value"])
+            self.assertNotIn("i915_vbt", intel_debug["files"])
+            self.assertFalse(any(name.endswith("i915_vbt.bin") for name in raw))
+
+    def test_staged_import_rejects_mismatched_or_ambiguous_device_provenance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Fixture(temp)
+            mismatch = fixture.staged_import(Path(temp) / "mismatch", target_bdf="0000:00:04.0")
+            with self.assertRaises(collector.EvidenceImportError):
+                fixture.collect(import_evidence_dir=mismatch)
+            ambiguous = fixture.staged_import(
+                Path(temp) / "ambiguous",
+                identity_contents="i915 dev=0000:00:02.0 alias=0000:00:04.0",
+            )
+            with self.assertRaises(collector.EvidenceImportError):
+                fixture.collect(import_evidence_dir=ambiguous)
+
+    def test_staged_import_rejects_symlinks_and_oversized_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Fixture(temp)
+            import_dir = Path(temp) / "symlink-import"
+            import_dir.mkdir(mode=0o700)
+            target = Path(temp) / "outside.bin"
+            target.write_bytes(make_vbt())
+            target.chmod(0o600)
+            (import_dir / "vbt.bin").symlink_to(target)
+            manifest = {
+                "schema_version": 1,
+                "target_pci_bdf": "0000:00:02.0",
+                "collection_method": "approved read-only debugfs copy",
+                "source_identity": {"path": "/sys/kernel/debug/dri/7/name",
+                                    "contents": "i915 dev=0000:00:02.0"},
+                "files": {"i915_vbt": {"filename": "vbt.bin",
+                                          "source": "/sys/kernel/debug/dri/7/i915_vbt"}},
+            }
+            manifest_path = import_dir / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+            manifest_path.chmod(0o600)
+            with self.assertRaises(collector.EvidenceImportError):
+                fixture.collect(import_evidence_dir=import_dir)
+
+            oversized = fixture.staged_import(Path(temp) / "oversized")
+            (oversized / "vbt.bin").write_bytes(b"x" * (65_537))
+            (oversized / "vbt.bin").chmod(0o600)
+            with self.assertRaises(collector.EvidenceImportError):
+                fixture.collect(import_evidence_dir=oversized)
+
+    def test_staged_import_rejects_a_symlinked_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Fixture(temp)
+            actual = fixture.staged_import(Path(temp) / "actual-import")
+            linked = Path(temp) / "linked-import"
+            linked.symlink_to(actual, target_is_directory=True)
+            with self.assertRaises(collector.EvidenceImportError):
+                fixture.collect(import_evidence_dir=linked)
+
+    def test_vbt_shareable_checksum_status_reflects_checksum_not_other_parser_errors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Fixture(temp)
+            node = fixture.debug / "dri" / "7"
+            node.mkdir(parents=True)
+            (node / "name").write_text("i915 dev=0000:00:02.0\n")
+            unsupported = bytearray(make_vbt())
+            unsupported[48 + 16:48 + 18] = (257).to_bytes(2, "little")
+            unsupported[26] = 0
+            unsupported[26] = (-sum(unsupported)) & 0xFF
+            (node / "i915_vbt").write_bytes(unsupported)
+
+            report, _ = fixture.collect()
+            summary = collector.shareable_inventory(report)
+            checksum = summary["vbt"]["validated_files"][0]["header_checksum_valid"]
+            self.assertTrue(checksum["value"])
+            self.assertEqual(checksum["status"], "CONFIRMED")
+
     def test_malformed_vbt_metadata_is_rejected(self):
-        parsed = collector.parse_vbt(make_vbt(malformed=True))
+        parsed = collector.parse_vbt(make_vbt(malformed=True), family="TigerLake")
         self.assertFalse(parsed["valid"])
         self.assertEqual(parsed["error"], "invalid_vbt_bounds")
         self.assertEqual(collector.parse_vbt(b"$VBT")["error"], "truncated_vbt_header")

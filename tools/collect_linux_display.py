@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Collect a privacy-conscious, read-only Linux Intel display inventory.
 
-The collector reads sysfs/procfs and already-mounted debugfs files. It never
-mounts filesystems, writes hardware state, or runs a shell. Raw EDID, VBT,
-OpRegion, decoder output, and relevant kernel messages stay in a private
-0700/0600 session directory. Shareable output is built from an explicit
-allowlist and does not contain PCI addresses, EDID identity fields, raw data,
-host names, usernames, serial numbers, UUIDs, or arbitrary log lines.
+The collector reads sysfs/procfs and already-mounted debugfs files. An optional
+offline import accepts bounded, user-staged private copies of existing i915
+debugfs diagnostics; it never requests privileges. It never mounts filesystems,
+writes hardware state, or runs a shell. Raw EDID, VBT, OpRegion, decoder output,
+and relevant kernel messages stay in a private 0700/0600 session directory.
+Shareable output is built from an explicit allowlist and excludes direct PCI
+addresses, EDID identity fields, raw data, host names, usernames, serial
+numbers, UUIDs, and arbitrary log lines.
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +34,13 @@ _RELEVANT_LOG = re.compile(
     r"\b(i915|xe|drm|edp|eDP|vbt|opregion|aux|psr|backlight|link train|displayport)\b",
     re.IGNORECASE,
 )
+_IMPORT_BDB_FILES = {
+    "i915_vbt": 65_536,
+    "i915_opregion": 1_048_576,
+    "i915_display_info": 1_048_576,
+    "i915_edp_psr_status": 262_144,
+}
+_IMPORT_MANIFEST_LIMIT = 65_536
 _GPU_OPTION_KEYS = {
     "i915.enable_guc", "i915.enable_psr", "i915.enable_fbc", "i915.force_probe",
     "i915.modeset", "xe.force_probe", "xe.enable_psr", "xe.enable_fbc",
@@ -201,7 +211,9 @@ def parse_edid(data: bytes) -> dict[str, Any]:
     return result
 
 
-def _tgl_vbt_ddi(dvo: int) -> int | None:
+def _project_vbt_ddi(family: str | None, dvo: int) -> int | None:
+    if family != "TigerLake":
+        return None
     dp = (10, 7, 8, 9, 11, 13, 15, 17, 19)
     hdmi = (0, 1, 2, 3, 12, 14, 16, 18, 20)
     for port, (dp_code, hdmi_code) in enumerate(zip(dp, hdmi)):
@@ -210,7 +222,7 @@ def _tgl_vbt_ddi(dvo: int) -> int | None:
     return None
 
 
-def parse_vbt(data: bytes) -> dict[str, Any]:
+def parse_vbt(data: bytes, *, family: str | None = None) -> dict[str, Any]:
     """Validate bounded VBT/BDB metadata and extract General Definitions children."""
     result: dict[str, Any] = {
         "valid": False, "signature": None, "declared_length": None,
@@ -258,6 +270,13 @@ def parse_vbt(data: bytes) -> dict[str, Any]:
             return fail("truncated_bdb_block_header")
         block_id = bdata[offset]
         block_length = int.from_bytes(bdata[offset + 1:offset + 3], "little")
+        if block_id == 53:
+            if bdb_length - offset < 4:
+                return fail("truncated_bdb_block_header")
+            if bdata[offset + 3] >= 3:
+                if bdb_length - offset < 8:
+                    return fail("truncated_bdb_block_header")
+                block_length = int.from_bytes(bdata[offset + 4:offset + 8], "little")
         if block_length > bdb_length - offset - 3:
             return fail("bdb_block_out_of_bounds")
         if block_id == 2:
@@ -273,15 +292,20 @@ def parse_vbt(data: bytes) -> dict[str, Any]:
     result["child_descriptor_stride"] = stride
     if stride < 38 or stride > 64 or (len(general) - 5) % stride:
         return fail("invalid_child_descriptor_layout")
+    mapped_slots: set[int] = set()
     for offset in range(5, len(general), stride):
         child = general[offset:offset + stride]
         port_type = int.from_bytes(child[2:4], "little")
         if not port_type:
             continue
         dvo, ddc, aux = child[16], child[19], child[25]
-        physical_slot = _tgl_vbt_ddi(dvo)
+        physical_slot = _project_vbt_ddi(family, dvo)
         if physical_slot is None:
             result["unmapped_children"] += 1
+        elif physical_slot in mapped_slots:
+            return fail("conflicting_child_records")
+        else:
+            mapped_slots.add(physical_slot)
         result["children"].append({
             "port_type": port_type, "dvo_port": dvo, "ddc_pin": ddc,
             "aux_channel": aux, "physical_ddi_slot_from_project_parser": physical_slot,
@@ -637,6 +661,16 @@ def _topology_inventory(connectors: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _debugfs_name_matches_bdf(name: str, bdf: str) -> bool:
+    """Require the DRI name's explicit dev field to identify exactly one PCI address."""
+    normalized_bdf = bdf.lower()
+    identities = {match.lower() for match in re.findall(
+        r"\b[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]\b", name)}
+    declared = re.findall(r"\bdev=([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])\b",
+                          name, flags=re.IGNORECASE)
+    return identities == {normalized_bdf} and len(declared) == 1 and declared[0].lower() == normalized_bdf
+
+
 def _scan_debugfs(debug_root: Path, intel_devices: list[dict[str, Any]], raw: dict[str, bytes]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "availability": evidence(None, "/sys/kernel/debug", "inspect already-mounted debugfs only",
@@ -671,7 +705,7 @@ def _scan_debugfs(debug_root: Path, intel_devices: list[dict[str, Any]], raw: di
         matching: list[tuple[Path, str]] = []
         for node in nodes:
             name, _, _ = _read_text(node / "name")
-            if name and device["bdf"] in name:
+            if name and _debugfs_name_matches_bdf(name, device["bdf"]):
                 matching.append((node, name))
         if len(matching) != 1:
             result["devices"].append({
@@ -700,11 +734,13 @@ def _scan_debugfs(debug_root: Path, intel_devices: list[dict[str, Any]], raw: di
                                                    interpretation="No data was collected.",
                                                    ambiguity="The file may be unavailable for this driver or kernel.", error=error)
                 continue
-            raw_name = f"intel-{len([x for x in raw if x.startswith('intel-debug-')]):02d}-{filename}.bin"
+            raw_index = len([name for name in raw if name.startswith("intel-debug-")])
+            raw_name = f"intel-debug-{raw_index:02d}-{filename}.bin"
             raw[raw_name] = data
             filespec: dict[str, Any] = {"bytes": len(data), "raw_file": raw_name}
             if filename == "i915_vbt":
-                parsed = parse_vbt(data)
+                family = (device.get("source_catalog_match", {}).get("value", {}) or {}).get("family")
+                parsed = parse_vbt(data, family=family)
                 filespec["parsed"] = parsed
                 filespec["validation"] = evidence(parsed["valid"], f"/sys/kernel/debug/dri/{node.name}/{filename}",
                                                    "validate VBT signature, bounds, checksum, BDB and child records",
@@ -728,6 +764,227 @@ def _scan_debugfs(debug_root: Path, intel_devices: list[dict[str, Any]], raw: di
             item["files"][filename] = filespec
         result["devices"].append(item)
     return result
+
+
+class EvidenceImportError(ValueError):
+    """Raised when a staged diagnostic import is unsafe or ambiguously mapped."""
+
+
+def _open_private_import_directory(path: Path) -> int:
+    """Open and pin the final user-owned private import directory without following symlinks."""
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise EvidenceImportError("staged evidence directory is unavailable") from exc
+    if not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o077:
+        raise EvidenceImportError("staged evidence directory must be user-owned and private")
+    flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) |
+             getattr(os, "O_DIRECTORY", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise EvidenceImportError("staged evidence directory could not be opened safely") from exc
+    opened = os.fstat(descriptor)
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.getuid() or opened.st_mode & 0o077 or
+            (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+        os.close(descriptor)
+        raise EvidenceImportError("staged evidence directory identity changed during validation")
+    return descriptor
+
+
+def _read_import_regular_file(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
+    """Read a private regular file without following symlinks or accepting races."""
+    try:
+        before = (os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+                  if directory_fd is not None else os.lstat(path))
+    except OSError as exc:
+        raise EvidenceImportError("staged evidence path is unavailable") from exc
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o077:
+        raise EvidenceImportError("staged evidence must be a user-owned private regular file")
+    if before.st_size < 1 or before.st_size > limit:
+        raise EvidenceImportError("staged evidence file size is outside the allowed bound")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = (os.open(path.name, flags, dir_fd=directory_fd)
+                      if directory_fd is not None else os.open(path, flags))
+    except OSError as exc:
+        raise EvidenceImportError("staged evidence file could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid() or opened.st_mode & 0o077 or
+                (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+            raise EvidenceImportError("staged evidence file identity changed during validation")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(limit + 1)
+        after = os.fstat(descriptor)
+        if (len(data) != before.st_size or len(data) > limit or
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) !=
+                (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)):
+            raise EvidenceImportError("staged evidence file changed while being read")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise EvidenceImportError("import manifest contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _import_staged_evidence(report: dict[str, Any], raw: dict[str, bytes], import_dir: Path) -> None:
+    """Merge previously staged, private i915 debugfs reads into one inventory."""
+    directory_fd = _open_private_import_directory(import_dir)
+    try:
+        _import_staged_evidence_from_fd(report, raw, import_dir, directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _import_staged_evidence_from_fd(report: dict[str, Any], raw: dict[str, bytes], import_dir: Path,
+                                    directory_fd: int) -> None:
+    """Validate a staged import using its pinned private directory descriptor."""
+    manifest_path = import_dir / "manifest.json"
+    manifest_bytes = _read_import_regular_file(manifest_path, _IMPORT_MANIFEST_LIMIT,
+                                               directory_fd=directory_fd)
+    try:
+        manifest = json.loads(manifest_bytes, object_pairs_hook=_json_object_without_duplicates)
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+        raise EvidenceImportError("import manifest is not bounded valid JSON") from exc
+    required_keys = {"schema_version", "target_pci_bdf", "collection_method", "source_identity", "files"}
+    schema_version = manifest.get("schema_version") if isinstance(manifest, dict) else None
+    if (not isinstance(manifest, dict) or set(manifest) != required_keys or
+            isinstance(schema_version, bool) or schema_version != 1):
+        raise EvidenceImportError("import manifest schema is invalid")
+
+    target_bdf = manifest.get("target_pci_bdf")
+    if not isinstance(target_bdf, str) or not _BDF.fullmatch(target_bdf):
+        raise EvidenceImportError("import target PCI address is invalid")
+    target_bdf = target_bdf.lower()
+    matched_devices = [item for item in report["display_controllers"]
+                       if item.get("kind") == "Intel" and str(item.get("bdf", "")).lower() == target_bdf]
+    if len(matched_devices) != 1:
+        raise EvidenceImportError("import target does not uniquely match an observed Intel controller")
+
+    method = manifest.get("collection_method")
+    if (not isinstance(method, str) or not method or len(method) > 256 or
+            not all(char.isprintable() for char in method)):
+        raise EvidenceImportError("import collection method is invalid")
+
+    identity = manifest.get("source_identity")
+    if not isinstance(identity, dict) or set(identity) != {"path", "contents"}:
+        raise EvidenceImportError("import source identity is invalid")
+    identity_path = identity.get("path")
+    identity_contents = identity.get("contents")
+    identity_match = re.fullmatch(r"/sys/kernel/debug/dri/([0-9]+)/name", identity_path or "") \
+        if isinstance(identity_path, str) else None
+    if (not identity_match or not isinstance(identity_contents, str) or len(identity_contents) > 4096 or
+            not identity_contents or not all(char.isprintable() for char in identity_contents)):
+        raise EvidenceImportError("import source identity is invalid")
+    node_id = identity_match.group(1)
+    if not _debugfs_name_matches_bdf(identity_contents, target_bdf):
+        raise EvidenceImportError("debugfs name contents do not uniquely identify the requested Intel controller")
+
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files or not set(files).issubset(_IMPORT_BDB_FILES):
+        raise EvidenceImportError("import file list is invalid")
+    imported_files: dict[str, tuple[bytes, str, str]] = {}
+    filenames: set[str] = set()
+    for diagnostic, info in files.items():
+        if not isinstance(info, dict) or set(info) != {"filename", "source"}:
+            raise EvidenceImportError("import file record is invalid")
+        filename, source = info["filename"], info["source"]
+        if (not isinstance(filename, str) or filename in {".", ".."} or
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", filename) or filename in filenames):
+            raise EvidenceImportError("import filename is invalid")
+        source_match = re.fullmatch(
+            rf"/sys/kernel/debug/dri/{re.escape(node_id)}/{re.escape(diagnostic)}", source or "") \
+            if isinstance(source, str) else None
+        if not source_match:
+            raise EvidenceImportError("import source path does not match the identified debugfs node")
+        content = _read_import_regular_file(import_dir / filename, _IMPORT_BDB_FILES[diagnostic],
+                                            directory_fd=directory_fd)
+        filenames.add(filename)
+        imported_files[diagnostic] = (content, source, filename)
+
+    debugfs = report["debugfs"]
+    debug_devices = debugfs.setdefault("devices", [])
+    existing = [item for item in debug_devices if str(item.get("bdf", "")).lower() == target_bdf]
+    if len(existing) > 1:
+        raise EvidenceImportError("observed debugfs mapping is ambiguous for the import target")
+    device = existing[0] if existing else {
+        "bdf": target_bdf,
+        "files": {},
+    }
+    current_node = device.get("node", {}).get("value")
+    current_name = device.get("name", {}).get("value")
+    if current_node is not None and str(current_node) != node_id:
+        raise EvidenceImportError("staged node conflicts with the directly observed debugfs mapping")
+    if current_name is not None and current_name != identity_contents:
+        raise EvidenceImportError("staged name contents conflict with the directly observed debugfs identity")
+    device["node"] = evidence(node_id, identity_path, "match staged debugfs name provenance to Intel PCI address")
+    device["name"] = evidence(identity_contents, identity_path, "record staged debugfs name provenance")
+    device_files = device.setdefault("files", {})
+    for diagnostic in imported_files:
+        current = device_files.get(diagnostic, {})
+        if isinstance(current, dict) and current.get("raw_file"):
+            raise EvidenceImportError("import duplicates directly collected data for the same diagnostic")
+
+    provenance = {
+        "manifest_path": str(manifest_path),
+        "target_pci_bdf": evidence(target_bdf, "manifest.json", "match explicit import target to one Intel PCI controller"),
+        "source_identity_path": evidence(identity_path, "manifest.json", "validate staged debugfs node identity path"),
+        "source_identity_contents": evidence(identity_contents, identity_path,
+                                              "validate the DRI name content includes only the target PCI address"),
+        "collection_method": evidence(method, "manifest.json", "record the declared read-only staging method"),
+        "files": {},
+    }
+    for diagnostic, (content, source, filename) in imported_files.items():
+        index = sum(1 for key in raw if key.startswith("intel-import-"))
+        raw_name = f"intel-import-{index:02d}-{diagnostic}.bin"
+        raw[raw_name] = content
+        entry: dict[str, Any] = {
+            "bytes": len(content), "raw_file": raw_name,
+            "import": evidence(filename, source, "read bounded user-staged regular file through the offline import interface",
+                               interpretation="No privileges were requested by the collector; raw bytes remain private.",
+                               ambiguity="The manifest records the declared source and method; staging itself is not independently authenticated."),
+        }
+        if diagnostic == "i915_vbt":
+            family = (matched_devices[0].get("source_catalog_match", {}).get("value", {}) or {}).get("family")
+            parsed = parse_vbt(content, family=family)
+            entry["parsed"] = parsed
+            entry["validation"] = evidence(
+                parsed["valid"], source, "validate VBT signature, bounds, checksum, BDB and child records",
+                status="CONFIRMED" if parsed["valid"] else "CONTRADICTED",
+                confidence="high" if parsed["valid"] else "none",
+                interpretation="Independent bounded parser; raw VBT remains private.",
+                ambiguity=parsed["error"] or "Validated firmware declarations do not establish live link state.",
+            )
+        elif diagnostic in {"i915_display_info", "i915_edp_psr_status"}:
+            text = content.decode("utf-8", errors="replace")
+            excerpts = [{"line": number, "text": line.strip()[:500]}
+                        for number, line in enumerate(text.splitlines(), 1)
+                        if _RELEVANT_LOG.search(line)][:120]
+            entry["relevant_lines"] = evidence(
+                excerpts, source, "allowlisted line selection from staged read-only driver diagnostic",
+                status="CONFIRMED" if excerpts else "UNKNOWN", confidence="high" if excerpts else "none",
+                interpretation="Selected lines are preserved privately for manual topology review.",
+                ambiguity="Kernel-version-specific text is not treated as proof of undocumented wiring.",
+            )
+        else:
+            entry["availability"] = evidence(True, source, "import staged read-only diagnostic bytes")
+        device_files[diagnostic] = entry
+        provenance["files"][diagnostic] = {
+            "filename": evidence(filename, str(import_dir), "read private staged file"),
+            "source": evidence(source, "manifest.json", "record the declared debugfs diagnostic path"),
+            "bytes": evidence(len(content), source, "bounded offline file read"),
+        }
+    device["import_provenance"] = provenance
+    if not existing:
+        debug_devices.append(device)
 
 
 def _collect_kernel_logs(raw: dict[str, bytes]) -> dict[str, Any]:
@@ -833,7 +1090,8 @@ def _module_inventory(proc_root: Path, sys_root: Path) -> dict[str, Any]:
 
 def collect_inventory(*, sys_root: Path = Path("/sys"), proc_root: Path = Path("/proc"),
                       etc_root: Path = Path("/etc"), debug_root: Path = Path("/sys/kernel/debug"),
-                      read_kernel_logs: bool = True) -> tuple[dict[str, Any], dict[str, bytes]]:
+                      read_kernel_logs: bool = True,
+                      import_evidence_dir: Path | None = None) -> tuple[dict[str, Any], dict[str, bytes]]:
     """Collect observations from supplied roots (defaulting to the running host)."""
     raw: dict[str, bytes] = {}
     system = _system_inventory(sys_root, proc_root, etc_root)
@@ -900,6 +1158,8 @@ def collect_inventory(*, sys_root: Path = Path("/sys"), proc_root: Path = Path("
         "debugfs": debugfs,
         "kernel_messages": logs,
     }
+    if import_evidence_dir is not None:
+        _import_staged_evidence(report, raw, import_evidence_dir)
     return report, raw
 
 
@@ -999,16 +1259,34 @@ def shareable_inventory(report: dict[str, Any]) -> dict[str, Any]:
                                          "parse bounded BDB header", status="CONFIRMED" if parsed["valid"] else "UNKNOWN",
                                          confidence="high" if parsed["valid"] else "none",
                                          interpretation="Firmware metadata version only.", ambiguity="Does not establish runtime display state."),
+                "declared_length": evidence(parsed["declared_length"], "matched Intel read-only VBT interface",
+                                            "parse bounded VBT header", status="CONFIRMED" if parsed["valid"] else "UNKNOWN",
+                                            confidence="high" if parsed["valid"] else "none",
+                                            interpretation="VBT header declared length.", ambiguity="Does not establish runtime display state."),
+                "header_checksum_valid": evidence(parsed["header_checksum_valid"], "matched Intel read-only VBT interface",
+                                                  "validate VBT checksum over declared bytes",
+                                                  status="CONFIRMED" if parsed["header_checksum_valid"] is True else
+                                                  "CONTRADICTED" if parsed["header_checksum_valid"] is False else "UNKNOWN",
+                                                  confidence="high" if isinstance(parsed["header_checksum_valid"], bool) else "none",
+                                                  interpretation="Checksum validity for the VBT header-declared extent.",
+                                                  ambiguity="A valid checksum does not establish supported topology."),
+                "bdb_length": evidence(parsed["bdb_length"], "matched Intel read-only VBT interface",
+                                       "parse bounded BDB header", status="CONFIRMED" if parsed["valid"] else "UNKNOWN",
+                                       confidence="high" if parsed["valid"] else "none",
+                                       interpretation="BDB header declared length.", ambiguity="Does not establish runtime display state."),
                 "child_descriptor_stride": evidence(parsed["child_descriptor_stride"], "matched Intel read-only VBT interface",
                                                       "parse General Definitions block", status="CONFIRMED" if parsed["valid"] else "UNKNOWN",
                                                       confidence="high" if parsed["valid"] else "none",
                                                       interpretation="Descriptor byte stride.", ambiguity="Does not establish live connector wiring."),
                 "children": [{
+                    "port_type": child.get("port_type"),
                     "dvo_port": child.get("dvo_port"), "ddc_pin": child.get("ddc_pin"),
                     "aux_channel": child.get("aux_channel"),
                     "physical_ddi_slot_from_project_parser": child.get("physical_ddi_slot_from_project_parser"),
                     "firmware_internal_flag": child.get("firmware_internal_flag"),
                     "firmware_dp_flag": child.get("firmware_dp_flag"),
+                    "descriptor_flags": child.get("descriptor_flags"),
+                    "capabilities": child.get("capabilities"),
                     "source": "matched Intel read-only VBT interface; raw firmware omitted",
                     "method": "decode General Definitions child descriptor",
                     "status": "CONFIRMED" if parsed["valid"] else "UNKNOWN",
@@ -1023,15 +1301,23 @@ def shareable_inventory(report: dict[str, Any]) -> dict[str, Any]:
         if driver:
             drivers.append({"name": public_evidence(device["kernel_driver"], "Linux PCI driver binding"),
                              "controller_kind": device["kind"]})
-    acquisition_status = report["debugfs"]["availability"]["status"]
-    acquisition_availability = report["debugfs"]["availability"]["availability"]
-    for device in report["debugfs"].get("devices", []):
-        vbt = device.get("files", {}).get("i915_vbt", {})
-        if "parsed" not in vbt and vbt:
-            acquisition_status = vbt.get("status", "UNKNOWN")
-            acquisition_availability = vbt.get("availability", "MISSING")
-    acquisition_evidence = evidence(acquisition_status, "matched Intel driver debugfs interface; node omitted",
-                                    "inspect existing VBT interface without modifying system state",
+    observed_vbts = [device.get("files", {}).get("i915_vbt", {})
+                     for device in report["debugfs"].get("devices", [])]
+    acquired_vbt = any(vbt.get("raw_file") for vbt in observed_vbts)
+    acquisition_status = "CONFIRMED" if acquired_vbt else report["debugfs"]["availability"]["status"]
+    acquisition_availability = "AVAILABLE" if acquired_vbt else report["debugfs"]["availability"]["availability"]
+    if not acquired_vbt:
+        unavailable_vbts = [vbt for vbt in observed_vbts if vbt]
+        if unavailable_vbts:
+            acquisition_status = unavailable_vbts[0].get("status", "UNKNOWN")
+            acquisition_availability = unavailable_vbts[0].get("availability", "MISSING")
+    acquisition_source = (
+        "matched Intel debugfs diagnostic staged for offline import; path omitted"
+        if any(vbt.get("import") for vbt in observed_vbts) else
+        "matched Intel driver debugfs interface; node omitted"
+    )
+    acquisition_evidence = evidence(acquisition_status, acquisition_source,
+                                    "inspect matched Intel VBT or an offline staged read-only copy",
                                     status=acquisition_status, availability=acquisition_availability,
                                     confidence="none" if acquisition_status in {"BLOCKED", "UNKNOWN"} else "high",
                                     interpretation="VBT acquisition is reported independently from parser results.",
@@ -1108,6 +1394,9 @@ def render_private_markdown(report: dict[str, Any]) -> str:
     lines.append(f"Debugfs availability: {json.dumps(report['debugfs']['availability'], ensure_ascii=True)}\n")
     for device in report["debugfs"].get("devices", []):
         lines.extend([f"### Intel PCI device {device['bdf']}", "", f"DRI node: {json.dumps(device['node'], ensure_ascii=True)}", ""])
+        if device.get("import_provenance"):
+            lines.extend(["Staged import provenance:", "", json.dumps(device["import_provenance"], indent=2,
+                                                                            ensure_ascii=True, sort_keys=True), ""])
         for filename, info in device.get("files", {}).items():
             lines.extend([f"#### `{filename}`", ""])
             lines.append(json.dumps(info, indent=2, ensure_ascii=True, sort_keys=True))
@@ -1227,10 +1516,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", type=Path, default=_default_state_root(),
                         help="private parent directory; default is XDG_STATE_HOME or ~/.local/state")
+    parser.add_argument("--import-evidence-dir", type=Path,
+                        help="import bounded private diagnostics staged by approved read-only operations; never requests privileges")
     args = parser.parse_args(argv)
     try:
-        report, raw = collect_inventory()
+        report, raw = collect_inventory(import_evidence_dir=args.import_evidence_dir)
         session = write_reports(report, raw, args.output_root)
+    except EvidenceImportError as exc:
+        print(f"collector rejected staged evidence ({exc})", file=sys.stderr)
+        return 2
     except OSError as exc:
         print(f"collector could not safely write output ({type(exc).__name__})", file=sys.stderr)
         return 2
