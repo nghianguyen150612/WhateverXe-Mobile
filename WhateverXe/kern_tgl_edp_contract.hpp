@@ -9,6 +9,13 @@
 #include <stdint.h>
 #include "kern_xelp_platform.hpp"
 
+namespace TGLEDPClassify {
+class FirmwareValidator;
+#if defined(TGLEDP_CLASSIFY_TESTING)
+class TestEvidenceAuthority;
+#endif
+}
+
 namespace TGLEDP {
 
 constexpr uint32_t RequiredNativeProbeABI = 3; // Existing immutable ProbeConfig ABI.
@@ -37,6 +44,7 @@ enum class Rejection : uint32_t {
     DiagnosticOnly,
     UntrustedEvidence,
     PanelAbsent,
+    PanelPresenceUnknown,
     OwnershipUnknown,
     OwnershipConflict,
     AmbiguousRoute,
@@ -100,6 +108,7 @@ enum class EvidenceSource : uint8_t {
     SyntheticFixture
 };
 enum class ResourceOwner : uint8_t { Unknown, KnownFree, NativeDonor, ExternalDisplay, InternalEDP };
+enum class ConnectionState : uint8_t { Unknown, Disconnected, Connected };
 
 struct FirmwareIntegrity {
     bool checksumValid {};
@@ -109,8 +118,13 @@ struct FirmwareIntegrity {
     bool diagnosticOnly {};
 };
 
-struct RouteEvidence {
+// Route facts are public policy inputs, but trust is a separate opaque value.
+// A caller cannot promote a route by setting evidenceValidated: a validator
+// must issue a proof bound to every decision-relevant fact below, including
+// resource ownership. Copying the proof and editing a route invalidates it.
+struct RouteFacts {
     bool active {};
+    ConnectionState connection {ConnectionState::Unknown};
     Connector connector {Connector::Unknown};
     Role role {Role::Unknown};
     DDI ddi {DDI::Unknown};
@@ -123,6 +137,7 @@ struct RouteEvidence {
     bool evidenceValidated {};
     bool panelPresent {};
     bool displayPortSupported {};
+    bool typeCCapable {};
     bool backendCapable {};
     bool ownershipSnapshotComplete {};
     bool exclusiveOwnershipValidated {};
@@ -132,11 +147,82 @@ struct RouteEvidence {
     bool donorBindingCompatible {};
 };
 
+inline bool sameRouteFacts(const RouteFacts &a, const RouteFacts &b) {
+    return a.active == b.active && a.connection == b.connection &&
+        a.connector == b.connector && a.role == b.role && a.ddi == b.ddi &&
+        a.phyKind == b.phyKind && a.phy == b.phy && a.aux == b.aux && a.source == b.source &&
+        a.firmware.checksumValid == b.firmware.checksumValid &&
+        a.firmware.fullBDBStreamValid == b.firmware.fullBDBStreamValid &&
+        a.firmware.childTableValid == b.firmware.childTableValid &&
+        a.firmware.wholeImageValidated == b.firmware.wholeImageValidated &&
+        a.firmware.diagnosticOnly == b.firmware.diagnosticOnly &&
+        a.firmwareDerived == b.firmwareDerived && a.evidenceValidated == b.evidenceValidated &&
+        a.panelPresent == b.panelPresent && a.displayPortSupported == b.displayPortSupported &&
+        a.typeCCapable == b.typeCCapable && a.backendCapable == b.backendCapable &&
+        a.ownershipSnapshotComplete == b.ownershipSnapshotComplete &&
+        a.exclusiveOwnershipValidated == b.exclusiveOwnershipValidated &&
+        a.ddiOwner == b.ddiOwner && a.phyOwner == b.phyOwner && a.auxOwner == b.auxOwner &&
+        a.donorBindingCompatible == b.donorBindingCompatible;
+}
+
+class EvidenceAuthorization {
+    bool issued_ {};
+    RouteFacts facts_ {};
+
+    explicit EvidenceAuthorization(const RouteFacts &facts) : issued_(true), facts_(facts) {}
+    friend class ::TGLEDPClassify::FirmwareValidator;
+#if defined(TGLEDP_CLASSIFY_TESTING)
+    friend class ::TGLEDPClassify::TestEvidenceAuthority;
+#endif
+
+public:
+    EvidenceAuthorization() = default;
+
+    bool authorizes(const RouteFacts &facts) const {
+        return issued_ && sameRouteFacts(facts_, facts);
+    }
+};
+
+struct RouteEvidence : RouteFacts {
+    EvidenceAuthorization authorization;
+};
+
+struct RoutingSnapshot;
+
+struct SnapshotFacts {
+    bool complete {};
+    size_t count {};
+    RouteFacts routes[MaxRouteClaims] {};
+};
+
+class SnapshotAuthorization {
+    bool issued_ {};
+    SnapshotFacts facts_ {};
+
+    explicit SnapshotAuthorization(const SnapshotFacts &facts) : issued_(true), facts_(facts) {}
+#if defined(TGLEDP_CLASSIFY_TESTING)
+    friend class ::TGLEDPClassify::TestEvidenceAuthority;
+#endif
+
+public:
+    SnapshotAuthorization() = default;
+    bool authorizes(const RoutingSnapshot &snapshot) const;
+};
+
 struct RoutingSnapshot {
     bool complete {};
     size_t count {};
     RouteEvidence routes[MaxRouteClaims] {};
+    SnapshotAuthorization authorization;
 };
+
+inline bool SnapshotAuthorization::authorizes(const RoutingSnapshot &snapshot) const {
+    if (!issued_ || facts_.complete != snapshot.complete || facts_.count != snapshot.count ||
+        snapshot.count > MaxRouteClaims) return false;
+    for (size_t i = 0; i < snapshot.count; ++i)
+        if (!sameRouteFacts(facts_.routes[i], snapshot.routes[i])) return false;
+    return true;
+}
 
 struct ConnectorDecision : Decision {
     DDI ddi {DDI::Unknown};
@@ -151,10 +237,31 @@ inline bool knownDDI(DDI ddi) {
         ddi == DDI::F || ddi == DDI::G || ddi == DDI::H || ddi == DDI::I;
 }
 
-inline bool knownOwner(ResourceOwner owner) { return owner != ResourceOwner::Unknown; }
+inline bool comboDDI(DDI ddi) { return ddi == DDI::A || ddi == DDI::B; }
+inline bool typeCDDI(DDI ddi) {
+    return ddi == DDI::D || ddi == DDI::E || ddi == DDI::F || ddi == DDI::G ||
+        ddi == DDI::H || ddi == DDI::I;
+}
+inline bool knownAUX(AUX aux) {
+    return aux == AUX::A || aux == AUX::B || aux == AUX::C || aux == AUX::D ||
+        aux == AUX::E || aux == AUX::F || aux == AUX::G || aux == AUX::H;
+}
+inline bool validPhysicalPair(const RouteEvidence &route) {
+    if (comboDDI(route.ddi))
+        return route.phyKind == PHYKind::Combo && route.phy == (route.ddi == DDI::A ? 0U : 1U);
+    if (typeCDDI(route.ddi))
+        return route.phyKind == PHYKind::TypeC && route.phy == static_cast<uint8_t>(route.ddi) - 3U;
+    return false; // DDI C is not a supported physical TGL port.
+}
+
+inline bool knownOwner(ResourceOwner owner) {
+    return owner == ResourceOwner::KnownFree || owner == ResourceOwner::NativeDonor ||
+        owner == ResourceOwner::ExternalDisplay || owner == ResourceOwner::InternalEDP;
+}
 
 inline Decision trust(const RouteEvidence &route) {
     if (route.firmware.diagnosticOnly) return {Rejection::DiagnosticOnly};
+    if (!route.authorization.authorizes(route)) return {Rejection::UntrustedEvidence};
     if (route.firmwareDerived && route.source != EvidenceSource::StrictFirmware)
         return {Rejection::UntrustedEvidence};
     if (route.source == EvidenceSource::StrictFirmware) {
@@ -180,6 +287,9 @@ inline ConnectorDecision qualifyConnector(const Decision &gpu, const RoutingSnap
     if (!snapshot.complete || snapshot.count == 0 || snapshot.count > MaxRouteClaims || selected >= snapshot.count) {
         out.rejection = Rejection::InventoryIncomplete; return out;
     }
+    if (!snapshot.authorization.authorizes(snapshot)) {
+        out.rejection = Rejection::OwnershipUnknown; return out;
+    }
     const auto &route = snapshot.routes[selected];
     if (!route.active || route.connector == Connector::Unknown || route.role == Role::Unknown) {
         out.rejection = Rejection::RouteUnknown; return out;
@@ -190,13 +300,17 @@ inline ConnectorDecision qualifyConnector(const Decision &gpu, const RoutingSnap
     if (!route.backendCapable) { out.rejection = Rejection::BackendCapability; return out; }
     if (!route.displayPortSupported) { out.rejection = Rejection::Transport; return out; }
     if (!knownDDI(route.ddi)) { out.rejection = Rejection::DDI; return out; }
-    if (route.phyKind == PHYKind::TypeC) { out.rejection = Rejection::TypeCPhy; return out; }
+    if (typeCDDI(route.ddi) || route.phyKind == PHYKind::TypeC) { out.rejection = Rejection::TypeCPhy; return out; }
+    if (!comboDDI(route.ddi)) { out.rejection = Rejection::DDI; return out; }
     if (route.phyKind != PHYKind::Combo) {
         out.rejection = Rejection::PHY; return out;
     }
     if (route.phy == 0xFF) { out.rejection = Rejection::PHY; return out; }
-    if (route.aux == AUX::Unknown) { out.rejection = Rejection::AUX; return out; }
+    if (route.phy != (route.ddi == DDI::A ? 0U : 1U)) { out.rejection = Rejection::PHY; return out; }
+    if (!knownAUX(route.aux)) { out.rejection = Rejection::AUX; return out; }
     if (!route.panelPresent) { out.rejection = Rejection::PanelAbsent; return out; }
+    if (route.connection == ConnectionState::Unknown) { out.rejection = Rejection::PanelPresenceUnknown; return out; }
+    if (route.connection == ConnectionState::Disconnected) { out.rejection = Rejection::PanelAbsent; return out; }
     if (!route.ownershipSnapshotComplete || !route.exclusiveOwnershipValidated) {
         out.rejection = Rejection::OwnershipUnknown; return out;
     }
@@ -215,18 +329,21 @@ inline ConnectorDecision qualifyConnector(const Decision &gpu, const RoutingSnap
         out.rejection = Rejection::DonorBindingConflict; return out;
     }
     for (size_t i = 0; i < snapshot.count; ++i) {
-        if (i == selected || !snapshot.routes[i].active) continue;
+        if (i == selected) continue;
         const auto &other = snapshot.routes[i];
-        // An active claim with incomplete coordinates makes all ownership
-        // ambiguous; it is never treated as a free DDI, PHY or AUX channel.
-        if (!other.ownershipSnapshotComplete || !other.exclusiveOwnershipValidated || !knownDDI(other.ddi) ||
-            other.phyKind == PHYKind::Unknown || other.phy == 0xFF ||
-            other.aux == AUX::Unknown || !knownOwner(other.ddiOwner) || !knownOwner(other.phyOwner) ||
-            !knownOwner(other.auxOwner)) {
+        // Every record in a complete snapshot contributes ownership facts,
+        // even when the connector is disconnected or inactive. Unknown is
+        // never interpreted as a free physical resource.
+        if (!other.ownershipSnapshotComplete || !other.exclusiveOwnershipValidated ||
+            !other.authorization.authorizes(other) || !knownDDI(other.ddi) || !validPhysicalPair(other) ||
+            !knownOwner(other.ddiOwner) || !knownOwner(other.phyOwner) ||
+            other.ddiOwner != other.phyOwner ||
+            (other.displayPortSupported && (!knownAUX(other.aux) || !knownOwner(other.auxOwner) ||
+                                             other.auxOwner != other.ddiOwner))) {
             out.rejection = Rejection::OwnershipUnknown; return out;
         }
         if (other.ddi == route.ddi || (other.phyKind == route.phyKind && other.phy == route.phy) ||
-            other.aux == route.aux) {
+            (other.displayPortSupported && other.aux == route.aux)) {
             out.rejection = Rejection::AmbiguousRoute; return out;
         }
     }
